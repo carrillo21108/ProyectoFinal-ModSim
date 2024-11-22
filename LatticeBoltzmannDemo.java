@@ -4,7 +4,6 @@ import java.awt.image.MemoryImageSource;
 import java.text.DecimalFormat;
 
 /*	A lattice-Boltzmann simulation in Java
-	Reference: https://physics.weber.edu/schroeder/javacourse/LatticeBoltzmann.pdf
 */
 
 class LatticeBoltzmannDemo extends Canvas implements Runnable {
@@ -34,6 +33,8 @@ class LatticeBoltzmannDemo extends Canvas implements Runnable {
 	// Boolean array, true at sites that contain barriers:
 	boolean[][] barrier = new boolean[xdim][ydim];
 
+	int time = 0;	// time in units of the fundamental step size
+
 	// Array of colors for graphics:
 	int nColors = 600;
 
@@ -53,6 +54,10 @@ class LatticeBoltzmannDemo extends Canvas implements Runnable {
 	Image scaledImage;
 
 	boolean running = false;	// true when the simulation thread is running
+	int stepTime = 0;			// performance measure: time in ms for a single iteration of the algorithm
+	int collideTime = 0;
+	int streamTime = 0;
+	int paintTime = 0;
 	int mouseX, mouseY;		// mouse coordinates in grid units
 	boolean mouseDrawBarrier = true;	// true when mouse is drawing rather than erasing a barrier
 	
@@ -150,6 +155,17 @@ class LatticeBoltzmannDemo extends Canvas implements Runnable {
 				makeTriangle(20);
 			}
 		});
+
+		Button airfoilButton = new Button("Wing");
+		cPanel1.add(airfoilButton);
+		airfoilButton.addActionListener(new ActionListener() {
+				public void actionPerformed(ActionEvent e) {
+						clearBarriers();
+						makeAirfoil(xdim / 4, ydim / 2, 100, 12); // Posición y dimensiones del ala
+				}
+		});
+
+
 		Button starButton = new Button("Star");
 		cPanel1.add(starButton);
 		starButton.addActionListener(new ActionListener() {
@@ -207,6 +223,7 @@ class LatticeBoltzmannDemo extends Canvas implements Runnable {
 				}
 			}
 		}
+		time = 0;	// reset time variable
 	}
 
 	// Clear all the user-drawn barriers:
@@ -231,6 +248,44 @@ class LatticeBoltzmannDemo extends Canvas implements Runnable {
 			drawBarrier(x,y);
 		}
 	}
+
+	synchronized void makeAirfoil(int centerX, int centerY, int length, int thickness) {
+    mouseDrawBarrier = true;
+
+    // Parámetros del perfil NACA
+    double maxThickness = thickness / 100.0; // Grosor máximo como porcentaje del largo
+    double camber = -0.04; // Curvatura máxima (inversión para el lado inferior)
+    double camberPos = 0.4; // Posición de la curvatura máxima (40% del largo)
+
+    for (int x = 0; x < length; x++) {
+        // Coordenadas normalizadas
+        double xNorm = (double) x / length;
+
+        // Cálculo de la línea de curvatura (camber line)
+        double yCamber;
+        if (xNorm <= camberPos) {
+            yCamber = camber / (camberPos * camberPos) * (2 * camberPos * xNorm - xNorm * xNorm);
+        } else {
+            yCamber = camber / ((1 - camberPos) * (1 - camberPos)) * ((1 - 2 * camberPos) + 2 * camberPos * xNorm - xNorm * xNorm);
+        }
+
+        // Grosor del perfil (distancia simétrica desde la línea de curvatura)
+        double thicknessDist = 5 * maxThickness * (0.2969 * Math.sqrt(xNorm)
+                - 0.1260 * xNorm
+                - 0.3516 * xNorm * xNorm
+                + 0.2843 * xNorm * xNorm * xNorm
+                - 0.1015 * xNorm * xNorm * xNorm * xNorm);
+
+        // Coordenadas del perfil superior e inferior
+        int yUpper = (int) Math.round(centerY - (yCamber + thicknessDist) * length);
+        int yLower = (int) Math.round(centerY - (yCamber - thicknessDist) * length);
+
+        // Dibujar las barreras del ala
+        drawBarrier(centerX + x, yUpper);
+        drawBarrier(centerX + x, yLower);
+    }
+	}
+
 
 	// Create a circular barrier of given diameter:
 	synchronized void makeCircle(int diameter) {
@@ -318,6 +373,7 @@ class LatticeBoltzmannDemo extends Canvas implements Runnable {
 		}
 	}
 
+
 	synchronized void makeStar(int size) {
 		mouseDrawBarrier = true;
 		int centerX = ydim/2;
@@ -377,11 +433,20 @@ class LatticeBoltzmannDemo extends Canvas implements Runnable {
 		}
 	}
 
-	// Execute a single step of the algorithm
+	// Execute a single step of the algorithm:
+	// Times are on 3.06 GHz iMac, Java 6. On 2.4GHz MacBook Pro, all times are about 30% longer.
 	synchronized void doStep() {
+		long startTime = System.currentTimeMillis();
+		//force();
+		long forceTime = System.currentTimeMillis();
 		collide();
+		long afterCollideTime = System.currentTimeMillis();
+		collideTime = (int) (afterCollideTime - forceTime);		// 23-24 ms for 600x600 grid
 		stream();
+		streamTime = (int) (System.currentTimeMillis() - afterCollideTime);	// 9-10 ms for 600x600 grid
 		bounce();
+		stepTime = (int) (System.currentTimeMillis() - startTime);	// 33-35 ms for 600x600 grid
+		time++;
 		dataCanvas.repaint();
 	}
 
@@ -502,6 +567,8 @@ class LatticeBoltzmannDemo extends Canvas implements Runnable {
 	}
 	
 	// Bounce particles off of barriers:
+	// (The ifs are needed to prevent array index out of bounds errors. Could handle edges
+	//  separately to avoid this.)
 	void bounce() {
 		for (int x=0; x<xdim; x++) {
 			for (int y=0; y<ydim; y++) {
@@ -557,7 +624,9 @@ class LatticeBoltzmannDemo extends Canvas implements Runnable {
 					if (colorIndex >= nColors) colorIndex = nColors - 1;
 					theColor = colorInt[colorIndex];
 				}
-
+				// Now draw a square the hard way, one pixel at a time...
+				// (We could make the memory image one pixel per square and use drawImage to enlarge it,
+				//  but on Java 1.5 for Mac and perhaps others, this blurs the image.)
 				for (int j=0; j<pixelsPerSquare; j++) {		// loop over rows of pixels
 					for (int i=0; i<pixelsPerSquare; i++) {		// loop over columns of pixels
 						iPixels[pIndex] = theColor;
@@ -566,12 +635,14 @@ class LatticeBoltzmannDemo extends Canvas implements Runnable {
 					pIndex += (xdim-1) * pixelsPerSquare;	// go to the next row
 				}
 				pIndex += pixelsPerSquare * (1 - xdim * pixelsPerSquare);	// get ready for next square
+				//g.fillRect(x*pixelsPerSquare,(ydim-y-1)*pixelsPerSquare,pixelsPerSquare,pixelsPerSquare);
 			}
 			pIndex -= xdim * pixelsPerSquare * (1 - pixelsPerSquare);	// get ready for next grid row
 		}
 		iSource.newPixels(0,0,xdim*pixelsPerSquare,ydim*pixelsPerSquare);	// inform AWT that memory image has changed
 		g.drawImage(theImage,0,0,null);		// blast the image to the screen
-
+		
+		paintTime = (int) (System.currentTimeMillis() - startTime);
 	}	// end of paint method
 
 	// A grid point has been clicked or dragged; create or erase a barrier accordingly:
